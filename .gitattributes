@@ -1,0 +1,15 @@
+# Ensure consistent line endings
+* text=auto eol=lf
+
+# Treat these as text
+*.md text diff
+*.yml text diff
+*.json text diff
+*.js text diff
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary

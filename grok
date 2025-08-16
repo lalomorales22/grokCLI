@@ -1,0 +1,1609 @@
+#!/usr/bin/env node
+
+const { Command } = require('commander');
+const { OpenAI } = require('openai');
+const chalk = require('chalk');
+const readline = require('readline');
+const ora = require('ora');
+const inquirer = require('inquirer');
+const figlet = require('figlet');
+const gradient = require('gradient-string');
+const boxen = require('boxen');
+const Table = require('cli-table3');
+const fs = require('fs-extra');
+const path = require('path');
+const os = require('os');
+const { marked } = require('marked');
+const { markedTerminal } = require('marked-terminal');
+const { highlight } = require('cli-highlight');
+const cliProgress = require('cli-progress');
+const Conf = require('conf');
+const SetupWizard = require('./lib/setup');
+require('dotenv').config();
+
+// Debug logging setup (opt-in via env)
+const DEBUG = /^1|true|yes$/i.test(String(process.env.DEBUG || ''));
+const debugLogPath = path.join(process.cwd(), 'grok-debug.log');
+
+function debugLog(message, data = null) {
+    if (!DEBUG) return;
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] ${message}${data ? ' | Data: ' + JSON.stringify(data) : ''}\n`;
+    try {
+        fs.appendFileSync(debugLogPath, logEntry);
+    } catch (_) {
+        // ignore file write errors in non-writable environments
+    }
+    console.log(chalk.dim(`[DEBUG] ${message}`));
+}
+
+// Clear debug log on start
+if (DEBUG) {
+    try {
+        fs.writeFileSync(debugLogPath, `=== Grok CLI Debug Log Started at ${new Date().toISOString()} ===\n`);
+    } catch (_) {
+        // ignore
+    }
+    console.log(chalk.yellow(`Debug logging enabled. Logs will be written to: ${debugLogPath}`));
+}
+
+// Add process exit handlers to catch unexpected exits
+process.on('exit', (code) => {
+    debugLog(`Process exiting with code: ${code}`);
+});
+
+process.on('uncaughtException', (error) => {
+    debugLog('Uncaught Exception:', { error: error.message, stack: error.stack });
+    console.error(chalk.red('Uncaught Exception:'), error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    debugLog('Unhandled Rejection:', { reason, promise });
+    console.error(chalk.red('Unhandled Rejection:'), reason);
+});
+
+// Configure marked for terminal rendering
+marked.setOptions({
+    renderer: markedTerminal()
+});
+
+// Configuration store
+const config = new Conf({
+    projectName: 'grok-cli',
+    defaults: {
+        model: 'grok-4',
+        temperature: 0.7,
+        maxTokens: 2048,
+        streamMode: true,
+        searchMode: 'auto',
+        theme: 'cyberpunk'
+    }
+});
+
+// Check for API key before initializing client
+async function initializeClient() {
+    const apiKey = process.env.XAI_API_KEY || config.get('apiKey');
+    
+    if (!apiKey) {
+        const setup = new SetupWizard();
+        const newKey = await setup.checkAndSetup();
+        
+        if (!newKey) {
+            console.log(chalk.red('\n❌ No API key configured. Exiting...'));
+            console.log(chalk.dim('Run "grok config" to set up your API key.\n'));
+            process.exit(1);
+        }
+        
+        return new OpenAI({
+            apiKey: newKey,
+            baseURL: 'https://api.x.ai/v1',
+            timeout: 360000
+        });
+    }
+    
+    return new OpenAI({
+        apiKey: apiKey,
+        baseURL: 'https://api.x.ai/v1',
+        timeout: 360000
+    });
+}
+
+// Initialize OpenAI client (will be set in main)
+let client = null;
+
+// Available models
+const MODELS = {
+    'grok-4': { name: 'Grok-4', context: 256000, vision: true, tools: true, search: true },
+    'grok-3': { name: 'Grok-3', context: 131072, vision: false, tools: true, search: true },
+    'grok-3-mini': { name: 'Grok-3 Mini', context: 131072, vision: false, tools: true, search: true },
+    'grok-2-image-1212': { name: 'Grok-2 Image', context: 131072, vision: false, tools: false, search: false, imageGen: true }
+};
+
+// Chat history management
+class ChatHistory {
+    constructor() {
+        this.historyDir = path.join(os.homedir(), '.grok-cli', 'history');
+        this.currentSession = [];
+        this.sessionId = Date.now().toString();
+        fs.ensureDirSync(this.historyDir);
+    }
+
+    add(role, content) {
+        this.currentSession.push({ role, content, timestamp: new Date().toISOString() });
+    }
+
+    save() {
+        const filePath = path.join(this.historyDir, `session-${this.sessionId}.json`);
+        fs.writeJsonSync(filePath, this.currentSession, { spaces: 2 });
+        return filePath;
+    }
+
+    load(sessionId) {
+        const filePath = path.join(this.historyDir, `session-${sessionId}.json`);
+        if (fs.existsSync(filePath)) {
+            this.currentSession = fs.readJsonSync(filePath);
+            this.sessionId = sessionId;
+            return true;
+        }
+        return false;
+    }
+
+    list() {
+        const files = fs.readdirSync(this.historyDir);
+        return files.map(f => {
+            const session = fs.readJsonSync(path.join(this.historyDir, f));
+            return {
+                id: f.replace('session-', '').replace('.json', ''),
+                date: session[0]?.timestamp || 'Unknown',
+                messages: session.length
+            };
+        });
+    }
+
+    clear() {
+        this.currentSession = [];
+    }
+
+    getMessages() {
+        return this.currentSession.filter(m => m.role !== 'system').map(m => ({
+            role: m.role,
+            content: m.content
+        }));
+    }
+}
+
+// Tool/Function definitions for Grok
+const TOOLS = [
+    {
+        type: 'function',
+        function: {
+            name: 'read_file',
+            description: 'Read contents of a file',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: {
+                        type: 'string',
+                        description: 'Path to the file to read'
+                    }
+                },
+                required: ['path']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'write_file',
+            description: 'Write content to a file (creates if not exists)',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: {
+                        type: 'string',
+                        description: 'Path to the file to write'
+                    },
+                    content: {
+                        type: 'string',
+                        description: 'Content to write to the file'
+                    }
+                },
+                required: ['path', 'content']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'create_file',
+            description: 'Create a new file with content',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: {
+                        type: 'string',
+                        description: 'Path for the new file'
+                    },
+                    content: {
+                        type: 'string',
+                        description: 'Initial content for the file'
+                    }
+                },
+                required: ['path', 'content']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'list_directory',
+            description: 'List contents of a directory',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: {
+                        type: 'string',
+                        description: 'Path to the directory'
+                    }
+                },
+                required: ['path']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'web_search',
+            description: 'Search the web for information',
+            parameters: {
+                type: 'object',
+                properties: {
+                    query: {
+                        type: 'string',
+                        description: 'Search query'
+                    },
+                    source: {
+                        type: 'string',
+                        enum: ['web', 'news', 'x'],
+                        description: 'Source to search'
+                    }
+                },
+                required: ['query']
+            }
+        }
+    }
+];
+
+// ASCII Art Welcome Screen
+async function showWelcomeScreen() {
+    console.clear();
+    
+    // Animated ASCII art
+    const asciiArt = figlet.textSync('GROK-4 CLI', {
+        font: 'ANSI Shadow',
+        horizontalLayout: 'fitted',
+        verticalLayout: 'default'
+    });
+    
+    // Use black and white gradient instead of rainbow
+    const bwGradient = gradient(['#ffffff', '#888888', '#333333', '#888888', '#ffffff']);
+    console.log(bwGradient(asciiArt));
+    
+    // Loading animation
+    const spinner = ora({
+        text: 'Initializing Grok Neural Interface...',
+        spinner: 'dots12',
+        color: 'cyan'
+    }).start();
+    
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    spinner.text = 'Connecting to xAI servers...';
+    await new Promise(resolve => setTimeout(resolve, 800));
+    spinner.text = 'Loading language models...';
+    await new Promise(resolve => setTimeout(resolve, 800));
+    spinner.text = 'Activating quantum reasoning engine...';
+    await new Promise(resolve => setTimeout(resolve, 600));
+    spinner.succeed(chalk.green('✨ Grok-4 CLI Ready!'));
+    
+    // System info box
+    const systemInfo = boxen(
+        chalk.cyan('Version: ') + chalk.white('2.0.0') + '\n' +
+        chalk.cyan('Model: ') + chalk.white(config.get('model')) + '\n' +
+        chalk.cyan('API: ') + chalk.white('xAI v1') + '\n' +
+        chalk.cyan('Context: ') + chalk.white(MODELS[config.get('model')].context + ' tokens'),
+        {
+            padding: 1,
+            margin: 1,
+            borderStyle: 'double',
+            borderColor: 'cyan',
+            title: '🤖 System Status',
+            titleAlignment: 'center'
+        }
+    );
+    
+    console.log(systemInfo);
+    
+    // Tips
+    console.log(chalk.dim('\n💡 Tips:'));
+    console.log(chalk.dim('  • Type /help for commands'));
+    console.log(chalk.dim('  • Type /model to switch models'));
+    console.log(chalk.dim('  • Type exit to quit\n'));
+}
+
+// Execute tool functions
+async function executeTool(name, args, approvalMode = 'suggest') {
+    switch (name) {
+        case 'read_file':
+            if (approvalMode === 'suggest') {
+                const { approved } = await inquirer.prompt([{
+                    type: 'confirm',
+                    name: 'approved',
+                    message: `Allow reading file: ${args.path}?`,
+                    default: true
+                }]);
+                if (!approved) return 'Operation cancelled by user';
+            }
+            
+            try {
+                const content = await fs.readFile(args.path, 'utf-8');
+                return content;
+            } catch (err) {
+                return `Error reading file: ${err.message}`;
+            }
+            
+        case 'write_file':
+        case 'create_file':
+            // Always allow file creation/writing for AI assistance
+            try {
+                // Ensure directory exists
+                const dir = path.dirname(args.path);
+                await fs.ensureDir(dir);
+                
+                await fs.writeFile(args.path, args.content);
+                console.log(chalk.green(`✓ File created/updated: ${args.path}`));
+                return `File written successfully: ${args.path}`;
+            } catch (err) {
+                return `Error writing file: ${err.message}`;
+            }
+            
+        case 'list_directory':
+            try {
+                const files = await fs.readdir(args.path);
+                return files.join('\n');
+            } catch (err) {
+                return `Error listing directory: ${err.message}`;
+            }
+            
+        case 'web_search':
+            // This would be handled by Grok's built-in search
+            return 'Search handled by Grok Live Search';
+            
+        default:
+            return `Unknown tool: ${name}`;
+    }
+}
+
+// Process slash commands
+async function processSlashCommand(command, chatHistory, rl) {
+    const parts = command.split(' ');
+    const cmd = parts[0].toLowerCase();
+    
+    // Store tools state
+    if (!processSlashCommand.toolsEnabled) {
+        processSlashCommand.toolsEnabled = true; // Default to enabled
+    }
+    
+    switch (cmd) {
+        case '/help':
+            const helpTable = new Table({
+                head: [chalk.cyan('Command'), chalk.cyan('Description')],
+                style: { head: [], border: [] }
+            });
+            
+            helpTable.push(
+                ['/model', 'Switch between Grok models'],
+                ['/clear', 'Clear current conversation'],
+                ['/save', 'Save conversation to file'],
+                ['/load', 'Load previous conversation'],
+                ['/history', 'View conversation history'],
+                ['/search', 'Configure Live Search'],
+                ['/image', 'Generate images with Grok-2'],
+                ['/vision', 'Analyze an image'],
+                ['/tools', `Toggle function calling (currently: ${processSlashCommand.toolsEnabled ? 'ON' : 'OFF'})`],
+                ['/config', 'Configure settings'],
+                ['/export', 'Export conversation'],
+                ['/tokens', 'Show token usage'],
+                ['/exit', 'Exit the CLI']
+            );
+            
+            console.log('\n' + helpTable.toString() + '\n');
+            return true;
+            
+        case '/model':
+            const modelChoices = [
+                ...Object.keys(MODELS).map(key => ({
+                    name: `${MODELS[key].name} (${MODELS[key].context} tokens)`,
+                    value: key
+                })),
+                new inquirer.Separator(),
+                { name: '← Cancel', value: 'cancel' }
+            ];
+            
+            const { selectedModel } = await inquirer.prompt([{
+                type: 'list',
+                name: 'selectedModel',
+                message: 'Select a model:',
+                choices: modelChoices
+            }]);
+            
+            if (selectedModel === 'cancel') {
+                console.log(chalk.dim('Cancelled'));
+                return true;
+            }
+            
+            config.set('model', selectedModel);
+            console.log(chalk.green(`✓ Switched to ${MODELS[selectedModel].name}`));
+            return true;
+            
+        case '/clear':
+            chatHistory.clear();
+            console.clear();
+            console.log(chalk.yellow('Conversation cleared'));
+            return true;
+            
+        case '/save':
+            const savedPath = chatHistory.save();
+            console.log(chalk.green(`✓ Conversation saved to: ${savedPath}`));
+            return true;
+            
+        case '/load':
+            const loadSessions = chatHistory.list();
+            if (loadSessions.length === 0) {
+                console.log(chalk.yellow('No saved conversations to load'));
+            } else {
+                const loadChoices = [
+                    ...loadSessions.map(s => ({
+                        name: `${s.id} (${s.date}, ${s.messages} messages)`,
+                        value: s.id
+                    })),
+                    new inquirer.Separator(),
+                    { name: '← Cancel', value: 'cancel' }
+                ];
+                
+                const { sessionToLoad } = await inquirer.prompt([{
+                    type: 'list',
+                    name: 'sessionToLoad',
+                    message: 'Select conversation to load:',
+                    choices: loadChoices
+                }]);
+                
+                if (sessionToLoad === 'cancel') {
+                    console.log(chalk.dim('Cancelled'));
+                    return true;
+                }
+                
+                if (chatHistory.load(sessionToLoad)) {
+                    console.log(chalk.green(`✓ Loaded conversation from session ${sessionToLoad}`));
+                    // Display the loaded conversation
+                    const messages = chatHistory.getMessages();
+                    console.log(chalk.cyan('\n--- Loaded Conversation ---'));
+                    messages.forEach(msg => {
+                        if (msg.role === 'user') {
+                            console.log(chalk.blue('User: ') + msg.content);
+                        } else {
+                            console.log(chalk.green('Assistant: ') + msg.content.substring(0, 100) + '...');
+                        }
+                    });
+                    console.log(chalk.cyan('--- End of Loaded Conversation ---\n'));
+                } else {
+                    console.log(chalk.red('Failed to load conversation'));
+                }
+            }
+            return true;
+            
+        case '/history':
+            const sessions = chatHistory.list();
+            if (sessions.length === 0) {
+                console.log(chalk.yellow('No saved conversations'));
+            } else {
+                const historyTable = new Table({
+                    head: [chalk.cyan('Session ID'), chalk.cyan('Date'), chalk.cyan('Messages')]
+                });
+                sessions.forEach(s => {
+                    historyTable.push([s.id, s.date, s.messages]);
+                });
+                console.log('\n' + historyTable.toString() + '\n');
+            }
+            return true;
+            
+        case '/search':
+            const { searchMode } = await inquirer.prompt([{
+                type: 'list',
+                name: 'searchMode',
+                message: 'Select Live Search mode:',
+                choices: [
+                    { name: 'Auto (let Grok decide)', value: 'auto' },
+                    { name: 'Always On', value: 'on' },
+                    { name: 'Disabled', value: 'off' },
+                    new inquirer.Separator(),
+                    { name: '← Cancel', value: 'cancel' }
+                ]
+            }]);
+            
+            if (searchMode === 'cancel') {
+                console.log(chalk.dim('Cancelled'));
+                return true;
+            }
+            
+            config.set('searchMode', searchMode);
+            console.log(chalk.green(`✓ Live Search set to: ${searchMode}`));
+            return true;
+            
+        case '/image':
+            const imagePrompt = parts.slice(1).join(' ');
+            if (!imagePrompt) {
+                console.log(chalk.red('Please provide a prompt for image generation'));
+                return true;
+            }
+            
+            const imageSpinner = ora('Generating image...').start();
+            try {
+                const response = await client.images.generate({
+                    model: 'grok-2-image-1212',
+                    prompt: imagePrompt,
+                    n: 1,
+                    response_format: 'url'
+                });
+                
+                imageSpinner.text = 'Saving image locally...';
+                
+                // Save image to local folder
+                const imagesDir = path.join(process.cwd(), 'grok-images');
+                await fs.ensureDir(imagesDir);
+                
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                const filename = `grok-image-${timestamp}.png`;
+                const filepath = path.join(imagesDir, filename);
+                
+                // Download and save the image
+                const axios = require('axios');
+                const imageResponse = await axios.get(response.data[0].url, {
+                    responseType: 'arraybuffer'
+                });
+                await fs.writeFile(filepath, imageResponse.data);
+                
+                imageSpinner.succeed('Image generated and saved!');
+                console.log(chalk.cyan('Image URL: ') + response.data[0].url);
+                console.log(chalk.green('Saved to: ') + filepath);
+            } catch (error) {
+                imageSpinner.fail('Failed to generate image');
+                console.error(chalk.red('Error:'), error.message);
+            }
+            return true;
+            
+        case '/vision':
+            const visionArgs = parts.slice(1).join(' ').trim();
+            if (!visionArgs) {
+                // Interactive mode - prompt for image path and question
+                const { imagePath } = await inquirer.prompt([{
+                    type: 'input',
+                    name: 'imagePath',
+                    message: 'Enter the path to the image:',
+                    validate: (input) => {
+                        if (!input) return 'Please provide an image path';
+                        if (!fs.existsSync(input)) return 'Image file not found';
+                        return true;
+                    }
+                }]);
+                
+                const { question } = await inquirer.prompt([{
+                    type: 'input',
+                    name: 'question',
+                    message: 'What would you like to know about this image?',
+                    default: 'What is in this image?'
+                }]);
+                
+                const visionSpinner = ora('Analyzing image...').start();
+                
+                try {
+                    // Read and encode image
+                    const imageBuffer = await fs.readFile(imagePath);
+                    const base64Image = imageBuffer.toString('base64');
+                    const mimeType = imagePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+                    
+                    const response = await client.chat.completions.create({
+                        model: 'grok-4',
+                        messages: [{
+                            role: 'user',
+                            content: [
+                                { type: 'text', text: question },
+                                {
+                                    type: 'image_url',
+                                    image_url: {
+                                        url: `data:${mimeType};base64,${base64Image}`,
+                                        detail: 'high'
+                                    }
+                                }
+                            ]
+                        }]
+                    });
+                    
+                    visionSpinner.stop();
+                    const formattedResponse = marked(response.choices[0].message.content);
+                    console.log('\n' + formattedResponse);
+                    
+                    // Add to chat history
+                    chatHistory.add('user', `[Image: ${imagePath}] ${question}`);
+                    chatHistory.add('assistant', response.choices[0].message.content);
+                    
+                } catch (error) {
+                    visionSpinner.fail('Failed to analyze image');
+                    console.error(chalk.red('Error:'), error.message);
+                }
+            } else {
+                // Parse arguments if provided inline
+                const spaceIndex = visionArgs.indexOf(' ');
+                if (spaceIndex === -1) {
+                    console.log(chalk.red('Usage: /vision <image_path> <question>'));
+                    return true;
+                }
+                
+                const imagePath = visionArgs.substring(0, spaceIndex);
+                const question = visionArgs.substring(spaceIndex + 1);
+                
+                if (!fs.existsSync(imagePath)) {
+                    console.log(chalk.red('Error: Image file not found'));
+                    return true;
+                }
+                
+                const visionSpinner = ora('Analyzing image...').start();
+                
+                try {
+                    const imageBuffer = await fs.readFile(imagePath);
+                    const base64Image = imageBuffer.toString('base64');
+                    const mimeType = imagePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+                    
+                    const response = await client.chat.completions.create({
+                        model: 'grok-4',
+                        messages: [{
+                            role: 'user',
+                            content: [
+                                { type: 'text', text: question },
+                                {
+                                    type: 'image_url',
+                                    image_url: {
+                                        url: `data:${mimeType};base64,${base64Image}`,
+                                        detail: 'high'
+                                    }
+                                }
+                            ]
+                        }]
+                    });
+                    
+                    visionSpinner.stop();
+                    const formattedResponse = marked(response.choices[0].message.content);
+                    console.log('\n' + formattedResponse);
+                    
+                    // Add to chat history
+                    chatHistory.add('user', `[Image: ${imagePath}] ${question}`);
+                    chatHistory.add('assistant', response.choices[0].message.content);
+                    
+                } catch (error) {
+                    visionSpinner.fail('Failed to analyze image');
+                    console.error(chalk.red('Error:'), error.message);
+                }
+            }
+            return true;
+            
+        case '/config':
+            const { configChoice } = await inquirer.prompt([{
+                type: 'list',
+                name: 'configChoice',
+                message: 'What would you like to configure?',
+                choices: [
+                    'Temperature',
+                    'Max Tokens',
+                    'Stream Mode',
+                    'Theme',
+                    'API Key',
+                    new inquirer.Separator(),
+                    '← Back to chat'
+                ]
+            }]);
+            
+            if (configChoice === '← Back to chat') {
+                console.log(chalk.dim('Returning to chat...'));
+                return true;
+            }
+            
+            switch (configChoice) {
+                case 'Temperature':
+                    const { temp } = await inquirer.prompt([{
+                        type: 'number',
+                        name: 'temp',
+                        message: 'Set temperature (0.0 - 2.0):',
+                        default: config.get('temperature'),
+                        validate: (v) => v >= 0 && v <= 2
+                    }]);
+                    config.set('temperature', temp);
+                    console.log(chalk.green(`✓ Temperature set to ${temp}`));
+                    break;
+                    
+                case 'Max Tokens':
+                    const { tokens } = await inquirer.prompt([{
+                        type: 'number',
+                        name: 'tokens',
+                        message: 'Set max tokens:',
+                        default: config.get('maxTokens')
+                    }]);
+                    config.set('maxTokens', tokens);
+                    console.log(chalk.green(`✓ Max tokens set to ${tokens}`));
+                    break;
+                    
+                case 'Stream Mode':
+                    const { stream } = await inquirer.prompt([{
+                        type: 'confirm',
+                        name: 'stream',
+                        message: 'Enable streaming responses?',
+                        default: config.get('streamMode')
+                    }]);
+                    config.set('streamMode', stream);
+                    console.log(chalk.green(`✓ Streaming ${stream ? 'enabled' : 'disabled'}`));
+                    break;
+                    
+                case 'Theme':
+                    const { theme } = await inquirer.prompt([{
+                        type: 'list',
+                        name: 'theme',
+                        message: 'Select theme:',
+                        choices: ['cyberpunk', 'minimal', 'classic', 'neon'],
+                        default: config.get('theme')
+                    }]);
+                    config.set('theme', theme);
+                    console.log(chalk.green(`✓ Theme set to ${theme}`));
+                    break;
+                    
+                case 'API Key':
+                    const { newKey } = await inquirer.prompt([{
+                        type: 'password',
+                        name: 'newKey',
+                        message: 'Enter your xAI API key:',
+                        mask: '*',
+                        validate: (input) => {
+                            if (!input) return 'API key is required';
+                            if (!input.startsWith('xai-')) return 'API key should start with "xai-"';
+                            return true;
+                        }
+                    }]);
+                    config.set('apiKey', newKey);
+                    console.log(chalk.green('✓ API key updated successfully'));
+                    break;
+            }
+            
+            return true;
+            
+        case '/export':
+            const messages = chatHistory.getMessages();
+            if (messages.length === 0) {
+                console.log(chalk.yellow('No conversation to export'));
+                return true;
+            }
+            
+            const { exportFormat } = await inquirer.prompt([{
+                type: 'list',
+                name: 'exportFormat',
+                message: 'Select export format:',
+                choices: [
+                    { name: 'Markdown (.md)', value: 'markdown' },
+                    { name: 'JSON (.json)', value: 'json' },
+                    { name: 'Plain Text (.txt)', value: 'text' },
+                    { name: 'HTML (.html)', value: 'html' },
+                    new inquirer.Separator(),
+                    { name: '← Cancel', value: 'cancel' }
+                ]
+            }]);
+            
+            if (exportFormat === 'cancel') {
+                console.log(chalk.dim('Cancelled'));
+                return true;
+            }
+            
+            const exportDir = path.join(process.cwd(), 'grok-exports');
+            await fs.ensureDir(exportDir);
+            
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            let filename, content;
+            
+            switch (exportFormat) {
+                case 'markdown':
+                    filename = `conversation-${timestamp}.md`;
+                    content = '# Grok Conversation\n\n';
+                    messages.forEach(msg => {
+                        if (msg.role === 'user') {
+                            content += `## User\n${msg.content}\n\n`;
+                        } else {
+                            content += `## Assistant\n${msg.content}\n\n`;
+                        }
+                    });
+                    break;
+                    
+                case 'json':
+                    filename = `conversation-${timestamp}.json`;
+                    content = JSON.stringify(messages, null, 2);
+                    break;
+                    
+                case 'text':
+                    filename = `conversation-${timestamp}.txt`;
+                    content = '';
+                    messages.forEach(msg => {
+                        content += `${msg.role.toUpperCase()}:\n${msg.content}\n\n---\n\n`;
+                    });
+                    break;
+                    
+                case 'html':
+                    filename = `conversation-${timestamp}.html`;
+                    content = `<!DOCTYPE html>
+<html>
+<head>
+    <title>Grok Conversation</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .message { margin: 20px 0; padding: 15px; border-radius: 10px; }
+        .user { background: #e3f2fd; }
+        .assistant { background: #f5f5f5; }
+        .role { font-weight: bold; color: #333; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Grok Conversation</h1>`;
+                    messages.forEach(msg => {
+                        const roleClass = msg.role === 'user' ? 'user' : 'assistant';
+                        const roleLabel = msg.role === 'user' ? 'User' : 'Grok';
+                        content += `
+    <div class="message ${roleClass}">
+        <div class="role">${roleLabel}</div>
+        <div>${msg.content.replace(/\n/g, '<br>')}</div>
+    </div>`;
+                    });
+                    content += '\n</body>\n</html>';
+                    break;
+            }
+            
+            const filepath = path.join(exportDir, filename);
+            await fs.writeFile(filepath, content);
+            console.log(chalk.green(`✓ Conversation exported to: ${filepath}`));
+            return true;
+            
+        case '/tokens':
+            // Track total tokens for current session
+            if (!processSlashCommand.tokenUsage) {
+                processSlashCommand.tokenUsage = {
+                    totalTokens: 0,
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    totalCost: 0
+                };
+            }
+            
+            const tokenTable = new Table({
+                head: [chalk.cyan('Metric'), chalk.cyan('Value')],
+                style: { head: [], border: [] }
+            });
+            
+            tokenTable.push(
+                ['Total Tokens', processSlashCommand.tokenUsage.totalTokens],
+                ['Input Tokens', processSlashCommand.tokenUsage.inputTokens],
+                ['Output Tokens', processSlashCommand.tokenUsage.outputTokens],
+                ['Estimated Cost', `$${processSlashCommand.tokenUsage.totalCost.toFixed(6)}`],
+                ['Current Model', config.get('model')],
+                ['Messages in History', chatHistory.getMessages().length]
+            );
+            
+            console.log('\n' + tokenTable.toString() + '\n');
+            return true;
+            
+        case '/tools':
+            processSlashCommand.toolsEnabled = !processSlashCommand.toolsEnabled;
+            console.log(chalk.green(`✓ Function calling ${processSlashCommand.toolsEnabled ? 'enabled' : 'disabled'}`));
+            if (processSlashCommand.toolsEnabled) {
+                console.log(chalk.dim('Grok can now create, read, and modify files for you.'));
+            }
+            return true;
+            
+        case '/exit':
+        case '/quit':
+            rl.close();
+            return false;
+            
+        default:
+            console.log(chalk.yellow(`Unknown command: ${cmd}. Type /help for available commands.`));
+            return true;
+    }
+}
+
+// Enhanced chat function with all features
+async function enhancedChat(message, chatHistory, options = {}) {
+    const model = options.model || config.get('model');
+    const temperature = options.temperature || config.get('temperature');
+    const maxTokens = options.maxTokens || config.get('maxTokens');
+    const streamMode = options.stream !== undefined ? options.stream : config.get('streamMode');
+    const searchMode = options.searchMode || config.get('searchMode');
+    const useTools = options.tools || false;
+    
+    // Check for GROK.md context file
+    let systemPrompt = '';
+    const grokMdPath = path.join(process.cwd(), 'GROK.md');
+    if (fs.existsSync(grokMdPath)) {
+        systemPrompt = await fs.readFile(grokMdPath, 'utf-8');
+        console.log(chalk.dim('📄 Using GROK.md context'));
+    }
+    
+    // Add tool capabilities to system prompt if tools are enabled
+    if (useTools) {
+        const toolsPrompt = `
+You have access to the following tools/functions that you can use to help the user:
+
+1. **read_file** - Read the contents of any file
+2. **write_file/create_file** - Create new files or update existing ones
+3. **list_directory** - List files in a directory
+4. **web_search** - Search the web for information
+
+You can and should use these tools whenever the user asks you to:
+- Create files (HTML, Python, JavaScript, etc.)
+- Read existing files
+- Modify code
+- Search for information
+
+When a user asks you to create a file, USE THE write_file or create_file function to actually create it on their system. You have full capability to create, read, and modify files.`;
+        
+        systemPrompt = systemPrompt ? systemPrompt + '\n\n' + toolsPrompt : toolsPrompt;
+    }
+    
+    // Build messages array
+    const messages = [];
+    if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
+    }
+    messages.push(...chatHistory.getMessages());
+    
+    // Build request parameters
+    const requestParams = {
+        model,
+        messages,
+        temperature,
+        max_tokens: maxTokens,
+        stream: streamMode
+    };
+    
+    // Add Live Search if enabled
+    if (searchMode !== 'off') {
+        requestParams.search_parameters = {
+            mode: searchMode,
+            sources: [
+                { type: 'web' },
+                { type: 'news' },
+                { type: 'x' }
+            ],
+            return_citations: true,
+            max_search_results: 20
+        };
+    }
+    
+    // Add tools if enabled
+    if (useTools) {
+        requestParams.tools = TOOLS;
+        requestParams.tool_choice = 'auto';
+    }
+    
+    try {
+        if (streamMode) {
+            const stream = await client.chat.completions.create(requestParams);
+            
+            let fullResponse = '';
+            let tokenCount = 0;
+            
+            // Show initial streaming indicator
+            const spinner = ora({
+                text: 'Streaming response...',
+                spinner: 'dots12',
+                color: 'cyan'
+            }).start();
+            
+            let lastChunk = null;
+            let firstContent = true;
+            
+            for await (const chunk of stream) {
+                const content = chunk.choices[0]?.delta?.content || '';
+                
+                if (content && firstContent) {
+                    // Stop spinner and start showing content on new line
+                    spinner.stop();
+                    console.log(); // Ensure we're on a new line
+                    firstContent = false;
+                }
+                
+                if (content) {
+                    // Print content in green
+                    process.stdout.write(chalk.green(content));
+                    fullResponse += content;
+                }
+                
+                tokenCount++;
+                lastChunk = chunk;
+            }
+            
+            // If no content was received, stop spinner
+            if (firstContent) {
+                spinner.stop();
+            }
+            
+            console.log('\n'); // Add spacing after response
+            
+            // Save to history
+            chatHistory.add('user', message);
+            chatHistory.add('assistant', fullResponse);
+            
+            // Show token usage if available (from last chunk)
+            if (lastChunk && lastChunk.usage) {
+                console.log(chalk.dim(`📊 Tokens: ${lastChunk.usage.total_tokens} (Input: ${lastChunk.usage.prompt_tokens}, Output: ${lastChunk.usage.completion_tokens})`));
+                
+                // Update token tracking for /tokens command
+                if (!processSlashCommand.tokenUsage) {
+                    processSlashCommand.tokenUsage = {
+                        totalTokens: 0,
+                        inputTokens: 0,
+                        outputTokens: 0,
+                        totalCost: 0
+                    };
+                }
+                processSlashCommand.tokenUsage.totalTokens += lastChunk.usage.total_tokens;
+                processSlashCommand.tokenUsage.inputTokens += lastChunk.usage.prompt_tokens;
+                processSlashCommand.tokenUsage.outputTokens += lastChunk.usage.completion_tokens;
+                
+                // Calculate cost
+                const modelPricing = {
+                    'grok-4': { input: 3.00, output: 15.00 },
+                    'grok-3': { input: 3.00, output: 15.00 },
+                    'grok-3-mini': { input: 0.30, output: 0.50 }
+                };
+                
+                if (modelPricing[model]) {
+                    const inputCost = (lastChunk.usage.prompt_tokens / 1000000) * modelPricing[model].input;
+                    const outputCost = (lastChunk.usage.completion_tokens / 1000000) * modelPricing[model].output;
+                    processSlashCommand.tokenUsage.totalCost += (inputCost + outputCost);
+                }
+            }
+            
+        } else {
+            const spinner = ora('Thinking...').start();
+            const completion = await client.chat.completions.create(requestParams);
+            spinner.stop();
+            
+            const response = completion.choices[0].message;
+            
+            // Handle tool calls if present
+            if (response.tool_calls) {
+                console.log(chalk.yellow('\n🔧 Executing tools...'));
+                
+                for (const toolCall of response.tool_calls) {
+                    const args = JSON.parse(toolCall.function.arguments);
+                    console.log(chalk.dim(`  → ${toolCall.function.name}: ${JSON.stringify(args)}`));
+                    
+                    const result = await executeTool(
+                        toolCall.function.name,
+                        args,
+                        options.approvalMode || 'suggest'
+                    );
+                    
+                    console.log(chalk.dim(`  ← ${result.substring(0, 100)}...`));
+                }
+            }
+            
+            // Display response
+            const formattedResponse = marked(response.content);
+            console.log('\n' + formattedResponse);
+            
+            // Save to history
+            chatHistory.add('user', message);
+            chatHistory.add('assistant', response.content);
+            
+            // Show citations if present
+            if (completion.citations) {
+                console.log(chalk.dim('\n📚 Sources:'));
+                completion.citations.forEach((citation, i) => {
+                    console.log(chalk.dim(`  ${i + 1}. ${citation.url}`));
+                });
+            }
+            
+            // Show token usage
+            if (completion.usage) {
+                console.log(chalk.dim(`📊 Tokens: ${completion.usage.total_tokens} (Input: ${completion.usage.prompt_tokens}, Output: ${completion.usage.completion_tokens})`));
+                
+                // Update token tracking for /tokens command
+                if (!processSlashCommand.tokenUsage) {
+                    processSlashCommand.tokenUsage = {
+                        totalTokens: 0,
+                        inputTokens: 0,
+                        outputTokens: 0,
+                        totalCost: 0
+                    };
+                }
+                processSlashCommand.tokenUsage.totalTokens += completion.usage.total_tokens;
+                processSlashCommand.tokenUsage.inputTokens += completion.usage.prompt_tokens;
+                processSlashCommand.tokenUsage.outputTokens += completion.usage.completion_tokens;
+                
+                // Calculate cost
+                const modelPricing = {
+                    'grok-4': { input: 3.00, output: 15.00 },
+                    'grok-3': { input: 3.00, output: 15.00 },
+                    'grok-3-mini': { input: 0.30, output: 0.50 }
+                };
+                
+                if (modelPricing[model]) {
+                    const inputCost = (completion.usage.prompt_tokens / 1000000) * modelPricing[model].input;
+                    const outputCost = (completion.usage.completion_tokens / 1000000) * modelPricing[model].output;
+                    const totalCost = inputCost + outputCost;
+                    console.log(chalk.dim(`💰 Cost: $${totalCost.toFixed(6)}`));
+                    processSlashCommand.tokenUsage.totalCost += totalCost;
+                }
+            }
+        }
+        
+    } catch (error) {
+        console.error(chalk.red('\n❌ Error:'), error.message);
+        
+        // Retry logic for rate limits
+        if (error.status === 429) {
+            console.log(chalk.yellow('⏳ Rate limit hit. Waiting to retry...'));
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            return enhancedChat(message, chatHistory, options);
+        }
+    }
+    debugLog('Exiting enhancedChat function');
+}
+
+// Slash command definitions for autocomplete
+const SLASH_COMMANDS = [
+    { name: '/help', description: 'Show available commands' },
+    { name: '/model', description: 'Switch between Grok models' },
+    { name: '/clear', description: 'Clear current conversation' },
+    { name: '/save', description: 'Save conversation to file' },
+    { name: '/load', description: 'Load previous conversation' },
+    { name: '/history', description: 'View conversation history' },
+    { name: '/search', description: 'Configure Live Search' },
+    { name: '/image', description: 'Generate images with Grok-2' },
+    { name: '/vision', description: 'Analyze an image' },
+    { name: '/tools', description: 'Toggle function calling' },
+    { name: '/config', description: 'Configure settings' },
+    { name: '/export', description: 'Export conversation' },
+    { name: '/tokens', description: 'Show token usage' },
+    { name: '/exit', description: 'Exit the CLI' }
+];
+
+// Interactive chat mode
+async function startInteractiveChat() {
+    debugLog('Starting interactive chat mode');
+    // Initialize client with API key check
+    client = await initializeClient();
+    debugLog('Client initialized');
+    
+    await showWelcomeScreen();
+    
+    const chatHistory = new ChatHistory();
+    
+    // Check for resume session
+    const sessions = chatHistory.list();
+    if (sessions.length > 0) {
+        debugLog('Found existing sessions, showing resume prompt');
+        const { resumeChoice } = await inquirer.prompt([{
+            type: 'list',
+            name: 'resumeChoice',
+            message: 'Would you like to:',
+            choices: [
+                { name: 'Start new conversation', value: 'new' },
+                { name: 'Resume previous conversation', value: 'resume' }
+            ]
+        }]);
+        debugLog('Resume choice made:', { resumeChoice });
+        
+        if (resumeChoice === 'resume') {
+            const sessionChoices = [
+                ...sessions.map(s => ({
+                    name: `${s.id} (${s.date}, ${s.messages} messages)`,
+                    value: s.id
+                })),
+                new inquirer.Separator(),
+                { name: '← Start new instead', value: 'cancel' }
+            ];
+            
+            const { sessionId } = await inquirer.prompt([{
+                type: 'list',
+                name: 'sessionId',
+                message: 'Select conversation to resume:',
+                choices: sessionChoices
+            }]);
+            
+            if (sessionId !== 'cancel') {
+                chatHistory.load(sessionId);
+                console.log(chalk.green('✓ Conversation resumed'));
+            } else {
+                console.log(chalk.dim('Starting new conversation...'));
+            }
+        }
+    }
+    
+    debugLog('About to create readline interface');
+    
+    // Important: Save stdin/stdout references before any inquirer calls
+    const stdin = process.stdin;
+    const stdout = process.stdout;
+    
+    // CRITICAL FIX: Resume stdin after inquirer prompts
+    // Inquirer pauses stdin, which can cause readline to close
+    stdin.resume();
+    if (stdin.isTTY && stdin.setRawMode) {
+        stdin.setRawMode(false); // Ensure we're not in raw mode
+    }
+    debugLog('Stdin resumed after inquirer prompts, isTTY:', stdin.isTTY);
+    
+    const rl = readline.createInterface({
+        input: stdin,
+        output: stdout,
+        prompt: gradient.cristal('\n❯ '),
+        terminal: true,  // Ensure terminal mode is enabled
+        completer: (line) => {
+            // Autocomplete for slash commands
+            if (line.startsWith('/')) {
+                const hits = SLASH_COMMANDS
+                    .filter(cmd => cmd.name.startsWith(line))
+                    .map(cmd => cmd.name);
+                return [hits.length ? hits : SLASH_COMMANDS.map(cmd => cmd.name), line];
+            }
+            return [[], line];
+        },
+        // CRITICAL: Disable automatic close on end of input
+        crlfDelay: Infinity
+    });
+    
+    // Prevent readline from closing unexpectedly
+    rl.on('SIGCONT', () => {
+        debugLog('SIGCONT received - continuing readline');
+        rl.prompt();
+    });
+    
+    // Keep stdin open
+    stdin.on('end', () => {
+        debugLog('Stdin end event - preventing close');
+        stdin.resume();
+    });
+    
+    console.log(chalk.blue('\n🚀 Interactive chat started. Type /help for commands.'));
+    console.log(chalk.green('🔧 Function calling enabled - Grok can create, read, and modify files.'));
+    console.log(chalk.dim('💡 Tip: Type "/" to see available commands, "exit" to quit\n'));
+    
+    // Main chat loop with proper async/await flow
+    async function runChatLoop() {
+        debugLog('Starting main chat loop');
+        let shouldExit = false;
+        
+        while (!shouldExit) {
+            try {
+                // Get user input with prompt
+                rl.setPrompt(chalk.cyan('You: '));
+                rl.prompt();
+                const line = await new Promise((resolve) => {
+                    rl.once('line', resolve);
+                });
+                
+                debugLog('Line event received:', { input: line });
+                const input = line.trim();
+                
+                // Handle exit
+                if (input.toLowerCase() === 'exit' || input.toLowerCase() === 'quit') {
+                    const { saveBeforeExit } = await inquirer.prompt([{
+                        type: 'confirm',
+                        name: 'saveBeforeExit',
+                        message: 'Save conversation before exiting?',
+                        default: true
+                    }]);
+                    
+                    if (saveBeforeExit) {
+                        const savedPath = chatHistory.save();
+                        console.log(chalk.green(`✓ Conversation saved to: ${savedPath}`));
+                    }
+                    
+                    console.log(gradient(['#ffffff', '#888888', '#333333', '#888888', '#ffffff'])('\n\n👋 Thank you for using Grok-4 CLI!\n'));
+                    shouldExit = true;
+                    continue;
+                }
+                
+                // Handle slash commands
+                if (input.startsWith('/')) {
+                    if (input === '/') {
+                        console.log(chalk.dim('\n💡 Available commands:'));
+                        SLASH_COMMANDS.forEach(cmd => {
+                            console.log(chalk.yellow(`  ${cmd.name}`) + chalk.dim(` - ${cmd.description}`));
+                        });
+                        console.log();
+                    } else {
+                        const continueChat = await processSlashCommand(input, chatHistory, rl);
+                        if (!continueChat) {
+                            shouldExit = true;
+                        }
+                    }
+                    continue; // Continue to next iteration
+                }
+                
+                // Handle regular chat
+                if (input) {
+                    debugLog('Processing regular chat input');
+                    const toolsEnabled = processSlashCommand.toolsEnabled !== undefined 
+                        ? processSlashCommand.toolsEnabled 
+                        : true;
+                    
+                    // Add user message to chat history
+                    chatHistory.add('user', input);
+                    
+                    try {
+                        debugLog('Calling enhancedChat...');
+                        await enhancedChat(input, chatHistory, { tools: toolsEnabled });
+                        debugLog('enhancedChat completed successfully');
+                    } catch (error) {
+                        debugLog('Error in enhancedChat:', { error: error.message });
+                        console.error(chalk.red('\n❌ Error:'), error.message);
+                    }
+                }
+                
+                // Continue to next iteration of the loop
+                debugLog('Continuing chat loop...');
+                
+            } catch (error) {
+                debugLog('Error in chat loop:', { error: error.message });
+                console.error(chalk.red('Error in chat loop:'), error);
+                // Continue the loop even on error
+            }
+        }
+        
+        // Clean up and exit
+        debugLog('Exiting chat loop');
+        rl.close();
+        process.exit(0);
+    }
+    
+    // Handle SIGINT (Ctrl+C) gracefully
+    rl.on('SIGINT', () => {
+        console.log(chalk.yellow('\n\nReceived interrupt signal.'));
+        console.log(chalk.yellow('Goodbye! 👋'));
+        rl.close();
+        process.exit(0);
+    });
+    
+    // Start the chat loop
+    debugLog('Starting chat loop');
+    await runChatLoop();
+    debugLog('Chat loop ended');
+}
+
+// Command-line interface
+const program = new Command();
+
+program
+    .name('grok')
+    .description('Professional CLI for xAI Grok-4 API')
+    .version('2.0.0');
+
+program
+    .command('chat <message>')
+    .description('Send a message to Grok')
+    .option('-m, --model <model>', 'Model to use', 'grok-4')
+    .option('-s, --stream', 'Stream the response')
+    .option('-t, --tools', 'Enable function calling')
+    .option('--search <mode>', 'Live Search mode (auto/on/off)', 'auto')
+    .option('--temperature <temp>', 'Temperature (0-2)', parseFloat)
+    .option('--max-tokens <tokens>', 'Max tokens', parseInt)
+    .action(async (message, options) => {
+        client = await initializeClient();
+        const chatHistory = new ChatHistory();
+        await enhancedChat(message, chatHistory, options);
+    });
+
+program
+    .command('image <prompt>')
+    .description('Generate an image with Grok-2')
+    .option('-n, --number <n>', 'Number of images (1-10)', parseInt, 1)
+    .action(async (prompt, options) => {
+        client = await initializeClient();
+        const spinner = ora('Generating image...').start();
+        try {
+            const response = await client.images.generate({
+                model: 'grok-2-image-1212',
+                prompt: prompt,
+                n: options.number,
+                response_format: 'url'
+            });
+            
+            spinner.text = 'Saving images locally...';
+            
+            // Save images to local folder
+            const imagesDir = path.join(process.cwd(), 'grok-images');
+            await fs.ensureDir(imagesDir);
+            
+            const axios = require('axios');
+            const savedFiles = [];
+            
+            for (let i = 0; i < response.data.length; i++) {
+                const img = response.data[i];
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                const filename = `grok-image-${timestamp}-${i + 1}.png`;
+                const filepath = path.join(imagesDir, filename);
+                
+                // Download and save the image
+                const imageResponse = await axios.get(img.url, {
+                    responseType: 'arraybuffer'
+                });
+                await fs.writeFile(filepath, imageResponse.data);
+                savedFiles.push(filepath);
+                
+                console.log(chalk.cyan(`Image ${i + 1}: `) + img.url);
+                console.log(chalk.green(`Saved to: `) + filepath);
+            }
+            
+            spinner.succeed(`Generated and saved ${options.number} image(s)!`);
+            console.log(chalk.yellow(`\nAll images saved to: ${imagesDir}`));
+        } catch (error) {
+            spinner.fail('Failed to generate image');
+            console.error(chalk.red('Error:'), error.message);
+        }
+    });
+
+program
+    .command('vision <imagePath> <question>')
+    .description('Analyze an image with Grok-4 vision')
+    .action(async (imagePath, question) => {
+        if (!fs.existsSync(imagePath)) {
+            console.error(chalk.red('Error: Image file not found'));
+            return;
+        }
+        
+        client = await initializeClient();
+        const spinner = ora('Analyzing image...').start();
+        
+        try {
+            // Read and encode image
+            const imageBuffer = await fs.readFile(imagePath);
+            const base64Image = imageBuffer.toString('base64');
+            const mimeType = imagePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+            
+            const response = await client.chat.completions.create({
+                model: 'grok-4',
+                messages: [{
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: question },
+                        {
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:${mimeType};base64,${base64Image}`,
+                                detail: 'high'
+                            }
+                        }
+                    ]
+                }]
+            });
+            
+            spinner.stop();
+            const formattedResponse = marked(response.choices[0].message.content);
+            console.log('\n' + formattedResponse);
+            
+        } catch (error) {
+            spinner.fail('Failed to analyze image');
+            console.error(chalk.red('Error:'), error.message);
+        }
+    });
+
+program
+    .command('search <query>')
+    .description('Search with Grok Live Search')
+    .option('--source <source>', 'Search source (web/news/x)', 'web')
+    .option('--country <country>', 'Country code (e.g., US)', 'US')
+    .action(async (query, options) => {
+        client = await initializeClient();
+        const spinner = ora('Searching...').start();
+        
+        try {
+            const response = await client.chat.completions.create({
+                model: 'grok-4',
+                messages: [{ role: 'user', content: query }],
+                search_parameters: {
+                    mode: 'on',
+                    sources: [{
+                        type: options.source,
+                        country: options.country
+                    }],
+                    return_citations: true,
+                    max_search_results: 10
+                }
+            });
+            
+            spinner.stop();
+            const formattedResponse = marked(response.choices[0].message.content);
+            console.log('\n' + formattedResponse);
+            
+            if (response.citations && response.citations.length > 0) {
+                console.log(chalk.cyan('\n📚 Sources:'));
+                response.citations.forEach((citation, i) => {
+                    console.log(chalk.dim(`  ${i + 1}. ${citation.title || citation.url}`));
+                    console.log(chalk.dim(`     ${citation.url}`));
+                });
+            }
+            
+        } catch (error) {
+            spinner.fail('Search failed');
+            console.error(chalk.red('Error:'), error.message);
+        }
+    });
+
+program
+    .command('config')
+    .description('Configure Grok CLI settings')
+    .action(async () => {
+        const { action } = await inquirer.prompt([{
+            type: 'list',
+            name: 'action',
+            message: 'Configuration:',
+            choices: [
+                'View current settings',
+                'Set/Change API key',
+                'Run setup wizard',
+                'Set default model',
+                'Set temperature',
+                'Set max tokens',
+                'Reset to defaults'
+            ]
+        }]);
+        
+        switch (action) {
+            case 'View current settings':
+                const settingsTable = new Table({
+                    head: [chalk.cyan('Setting'), chalk.cyan('Value')]
+                });
+                
+                const apiKey = config.get('apiKey') || process.env.XAI_API_KEY;
+                settingsTable.push(
+                    ['API Key', apiKey ? '***' + apiKey.slice(-4) : 'Not set'],
+                    ['Model', config.get('model')],
+                    ['Temperature', config.get('temperature')],
+                    ['Max Tokens', config.get('maxTokens')],
+                    ['Stream Mode', config.get('streamMode')],
+                    ['Search Mode', config.get('searchMode')]
+                );
+                
+                console.log('\n' + settingsTable.toString() + '\n');
+                break;
+                
+            case 'Set/Change API key':
+                const setup = new SetupWizard();
+                await setup.run();
+                break;
+                
+            case 'Run setup wizard':
+                const wizard = new SetupWizard();
+                await wizard.run();
+                break;
+                
+            case 'Reset to defaults':
+                config.clear();
+                console.log(chalk.green('✓ Settings reset to defaults'));
+                break;
+        }
+    });
+
+// Parse arguments or start interactive mode
+if (process.argv.length <= 2) {
+    startInteractiveChat().catch(error => {
+        console.error(chalk.red('Fatal error starting chat:'), error);
+        process.exit(1);
+    });
+} else {
+    program.parse(process.argv);
+}

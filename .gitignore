@@ -1,0 +1,43 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# macOS
+.DS_Store
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.swp
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+grok-debug.log
+logs/
+debug.log
+
+# Build outputs / caches
+dist/
+build/
+coverage/
+.cache/
+.tmp/
+
+# Project artifacts
+grok-exports/
+grok-images/
+grok.backup
+.claude/
+session-*.json
+
+# Misc
+*.tmp
