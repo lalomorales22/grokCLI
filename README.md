@@ -1,4 +1,5 @@
 # 🤖 Grok-4 CLI
+<img width="875" height="487" alt="Screenshot 2025-08-15 at 10 57 03 PM" src="https://github.com/user-attachments/assets/f342b139-72ce-4e63-93f2-a0a19225f2d4" />
 
 A professional, feature-rich command-line interface for xAI's Grok API with advanced capabilities similar to Claude Code and Gemini CLI.
 
